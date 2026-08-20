@@ -1,0 +1,126 @@
+# rotor
+
+Small Sera Virtual Liquidity market maker.
+
+Rotor runs one autonomous command: `rotor mm vl`. On each cadence tick it fetches
+the latest source mid for each configured market, builds fixed-bps bid/ask quotes,
+cancels the previous tracked quote set when safe, and places the fresh set through
+Sera VL where possible. Filled sides tighten the opposite side to `return_bps`
+on the next tick.
+
+## Install
+
+```bash
+poetry install
+```
+
+## Configure
+
+Environment variables are preferred:
+
+```bash
+export SERA_BASE_URL="https://api.testnet.sera.cx/api/v1"  # must be https
+export SERA_API_KEY="..."
+export SERA_API_SECRET="..."
+export SERA_PRIVATE_KEY="0x..."
+export WISE_API_TOKEN="..."   # for price_source = wise
+export FRED_API_KEY="..."     # for price_source = fed (free FRED API key)
+```
+
+`SERA_BASE_URL` must use `https://` (the maker signs orders against it);
+`http://` is rejected outside `localhost`.
+
+For file-based local config, copy `.env.example` to the gitignored root `.env`
+and fill in real values. `rotor/secret.example.py` remains available only as a
+Python fallback template for `rotor/secret.py`. Real environment variables
+override `.env`, and `.env` overrides `rotor/secret.py`.
+
+## VL Config
+
+```toml
+[[budget]]
+token = "USDC"
+amount = "5000"
+
+fixed_bps = "50"
+return_bps = "1"
+
+[[pair]]
+market = "XSGD/USDC"
+price_source = "wise"
+qty_base = "2000"
+
+[[pair]]
+market = "EURC/USDC"
+price_source = "ecb"
+qty_base = "1000"
+fixed_bps = "40"
+```
+
+Supported FX sources are `wise`, `ecb`, `fed`, `bnm`, and `mas`. `ecb`, `bnm`,
+and `mas` are keyless; `wise` needs `WISE_API_TOKEN` and `fed` (the official
+FRED API) needs a free `FRED_API_KEY`. `wise` prices the pair's size through the
+Wise quotes API, so its benchmark is the fee-inclusive effective rate for that
+amount; the other sources are pure mid rates.
+
+## Run
+
+```bash
+poetry run rotor mm vl --config rotor/vl.config.toml --dry-run --once
+poetry run rotor mm vl --config rotor/vl.config.toml --poll 305
+```
+
+Live mode always cancels reattached configured orders on boot. If Sera's cancel
+cooldown is active, Rotor waits 5 minutes and retries before quoting.
+
+Rotor keeps a tiny unresolved-state database at `.rotor_state.sqlite` by
+default. It stores only active orders and pending return-side signals, then
+prunes rows after cancellation or return-side use. Set `ROTOR_STATE_PATH` to
+move it.
+
+Add `--telegram` to send lifecycle/error alerts through the optional Telegram
+notifier. Install the extra with `poetry install --extras telegram` when real
+Telegram sends are needed; without the extra or token, sends degrade to dry-run
+logs.
+
+For autonomous source checkouts, add `--auto-update`. Rotor checks once per day,
+runs `git pull --ff-only` only on a clean worktree, stops the current loop after
+a successful pull, runs normal shutdown cleanup, and re-execs the same command.
+
+Logs are intentionally small for lightweight servers. The default log level is
+`WARNING`; per-tick quote and placement traces require `--log-level DEBUG`.
+
+## Development
+
+```bash
+poetry run ruff check rotor tests
+poetry run python -m pytest -q
+```
+
+Opt-in real Sera testnet checks are skipped by default:
+
+```bash
+ROTOR_RUN_TESTNET=1 poetry run python -m pytest -q tests/testnet
+```
+
+Opt-in live FX source checks (keyless `ecb`/`bnm`/`mas`; `fed`/`wise` run when
+their key is set) are also skipped by default:
+
+```bash
+make live-prices   # or: ROTOR_RUN_LIVE_PRICES=1 poetry run python -m pytest -q tests/live
+```
+
+The two-wallet maker/taker E2E and the heavier live runner scenarios are
+separately gated because they place real testnet orders. See
+[tests/testnet/README.md](tests/testnet/README.md).
+
+## Deploy on Manus
+
+To run on [Manus](https://manus.im): register the secrets from
+[`.env.manus.example`](.env.manus.example) (exact names) in the Manus secret
+store, and schedule the fire-once command (`./scripts/manus_run_once.sh`, i.e.
+`rotor mm vl --once`) on a ≥5-minute cadence. Each fire reattaches from Sera,
+requotes, and exits without blocking on cancel cooldowns. See
+[docs/manus.md](docs/manus.md).
+
+See [docs/vl-mm.md](docs/vl-mm.md) for operator details.

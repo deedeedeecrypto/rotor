@@ -1,0 +1,1456 @@
+"""Multi-pair VL placement runner for Rotor market making.
+
+The runner keeps quote generation in the normal algorithm stack, then groups
+non-null order intents by spent token. Eligible same-spent-token groups use
+Sera Virtual Liquidity; singletons and unbudgeted groups use standalone order
+placement.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import sqlite3
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+
+try:  # pragma: no cover - POSIX-only single-instance lock.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback (no flock).
+    fcntl = None
+
+from rotor.algo import (
+    QuoteSet,
+    SimpleMarketMakingAlgo,
+    SimpleMarketMakingConfig,
+)
+from rotor.config import get_config
+from rotor.mm.exchange import errors
+from rotor.mm.exchange.client import OrderRecord, SeraClient, VLBatchResult, VLLeg
+from rotor.mm.quote_engine import (
+    LiveOrder,
+    StopFlag,
+    all_requote_safe,
+    build_algo,
+    build_client,
+    fmt,
+    fmt_optional,
+    parse_ts,
+    sleep_remaining,
+)
+from rotor.mm.quote_engine import (
+    quote as dispatch_quote,
+)
+from rotor.mm.vl_config import PairConfig, VLConfig, load_vl_config
+from rotor.notifications import TelegramNotifier
+from rotor.price_reference import (
+    ReferencePriceOracle,
+    load_price_reference_source,
+    load_token_to_iso,
+    market_to_iso_pair,
+)
+from rotor.updater import (
+    DEFAULT_UPDATE_INTERVAL_SECONDS,
+    DailyGitUpdater,
+    restart_current_process,
+)
+
+BOOT_CANCEL_RETRY_SECONDS = 300.0
+DEFAULT_STATE_PATH = ".rotor_state.sqlite"
+
+
+@dataclass(frozen=True)
+class PairRuntime:
+    """Runtime state for one configured market."""
+
+    # Validated static TOML row for this market.
+    config: PairConfig
+    # Sera market metadata from the bootstrapped client.
+    info: object
+    # Pure quote algorithm configured for this pair.
+    algo: object
+    # Freshness-checking price oracle for this pair's reference source.
+    oracle: ReferencePriceOracle
+    # ISO currency symbols used by the reference oracle.
+    iso_base: str
+    iso_quote: str
+
+
+@dataclass(frozen=True)
+class OrderIntent:
+    """One non-null order emitted by the current algo."""
+
+    # Sera market to quote.
+    market: str
+    # Side to place, bid or ask.
+    side: str
+    # Base-token order size.
+    qty_base: Decimal
+    # Limit price in quote-per-base terms.
+    price: Decimal
+    # Unix-seconds order expiry.
+    expiration: int
+    # Token spent by this side; used for VL grouping and budget checks.
+    spent_token: str
+    # Benchmark mid used to create this intent.
+    benchmark_rate: Decimal
+
+
+@dataclass
+class LivePlacement:
+    """Local state for one standalone order or VL batch."""
+
+    # "standalone" or "vl"; controls cancellation path.
+    kind: str
+    # Token whose budget/grouping this placement belongs to.
+    spent_token: str
+    # Live orders inside this placement.
+    orders: list[LiveOrder]
+    # Local placement time for cooldown guards.
+    placed_at: float
+    # VL batch id is present only for VL placements.
+    vl_batch_id: str | None = None
+    # Immediate fills returned by placement, when Sera provides them.
+    fills: list[dict] | None = None
+    # Maps order id to source intent so fills can choose the next tight side.
+    intent_by_order_id: dict[str, OrderIntent] | None = None
+
+
+class StateStore:
+    """Tiny unresolved-state store; this is not a trade-history database."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = ":memory:" if str(path) == ":memory:" else str(Path(path).expanduser())
+        self._lock_fp = None
+        if self.path != ":memory:":
+            parent = Path(self.path).parent
+            if str(parent) not in {"", "."}:
+                parent.mkdir(parents=True, exist_ok=True)
+            # Single-instance guard: two rotors on the same wallet/state would
+            # fight (cross-cancel, STP self-matches, clobbered tracking). Hold an
+            # exclusive advisory lock on a sibling .lock file for our lifetime.
+            self._acquire_single_instance_lock()
+        self._db = sqlite3.connect(self.path)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS active_orders (
+                order_id TEXT PRIMARY KEY,
+                uuid_int TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                spent_token TEXT NOT NULL,
+                placed_at REAL NOT NULL,
+                vl_batch_id TEXT,
+                qty_base TEXT
+            )
+        """)
+        self._ensure_active_order_columns()
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_returns (
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                PRIMARY KEY (market, side)
+            )
+        """)
+        self._db.commit()
+
+    def _ensure_active_order_columns(self) -> None:
+        columns = {
+            str(row[1])
+            for row in self._db.execute("PRAGMA table_info(active_orders)").fetchall()
+        }
+        if "qty_base" not in columns:
+            self._db.execute("ALTER TABLE active_orders ADD COLUMN qty_base TEXT")
+
+    def _acquire_single_instance_lock(self) -> None:
+        """Take an exclusive advisory lock so only one rotor uses this state."""
+        if fcntl is None:  # pragma: no cover - non-POSIX platforms.
+            return
+        lock_path = self.path + ".lock"
+        lock_fp = open(lock_path, "w")  # noqa: SIM115 - held for process lifetime.
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            lock_fp.close()
+            raise RuntimeError(
+                f"another rotor instance is using {self.path}; refusing to start "
+                "(set ROTOR_STATE_PATH to run a second instance on different state)"
+            ) from exc
+        self._lock_fp = lock_fp
+
+    def close(self) -> None:
+        self._db.close()
+        # Release and close the advisory lock so a clean restart can re-acquire it.
+        if self._lock_fp is not None:
+            if fcntl is not None:  # pragma: no branch - POSIX path.
+                with contextlib.suppress(OSError):
+                    fcntl.flock(self._lock_fp, fcntl.LOCK_UN)
+            self._lock_fp.close()
+            self._lock_fp = None
+
+    def replace_active(self, placements: list[LivePlacement]) -> None:
+        """Replace active unresolved orders, pruning completed/cancelled rows."""
+        rows = []
+        for placement in placements:
+            for order in placement.orders:
+                rows.append((
+                    order.order_id,
+                    str(order.uuid_int),
+                    order.market,
+                    order.side,
+                    placement.kind,
+                    placement.spent_token,
+                    float(order.placed_at),
+                    placement.vl_batch_id,
+                    str(order.qty_base) if order.qty_base is not None else None,
+                ))
+        with self._db:
+            self._db.execute("DELETE FROM active_orders")
+            self._db.executemany(
+                """
+                INSERT OR REPLACE INTO active_orders (
+                    order_id, uuid_int, market, side, kind, spent_token,
+                    placed_at, vl_batch_id, qty_base
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def load_active(self, markets: set[str]) -> list[LivePlacement]:
+        """Load unresolved active orders for configured markets."""
+        rows = self._db.execute(
+            """
+            SELECT order_id, uuid_int, market, side, kind, spent_token,
+                   placed_at, vl_batch_id, qty_base
+            FROM active_orders
+            ORDER BY COALESCE(vl_batch_id, ''), placed_at, order_id
+            """
+        ).fetchall()
+        standalone: list[LivePlacement] = []
+        batches: dict[str, tuple[str, list[LiveOrder]]] = {}
+        for (
+            order_id,
+            uuid_int,
+            market,
+            side,
+            kind,
+            spent_token,
+            placed_at,
+            batch_id,
+            qty_base,
+        ) in rows:
+            if market not in markets:
+                continue
+            order = LiveOrder(
+                side=side,
+                order_id=order_id,
+                uuid_int=int(uuid_int),
+                placed_at=float(placed_at),
+                market=market,
+                qty_base=Decimal(str(qty_base)) if qty_base is not None else None,
+            )
+            if kind == "vl" and batch_id:
+                token, orders = batches.setdefault(batch_id, (spent_token, []))
+                orders.append(order)
+                batches[batch_id] = (token, orders)
+            else:
+                standalone.append(
+                    LivePlacement(
+                        kind="standalone",
+                        spent_token=spent_token,
+                        orders=[order],
+                        placed_at=order.placed_at,
+                    )
+                )
+        out = list(standalone)
+        for batch_id, (spent_token, orders) in batches.items():
+            out.append(
+                LivePlacement(
+                    kind="vl",
+                    spent_token=spent_token,
+                    orders=orders,
+                    placed_at=min(order.placed_at for order in orders),
+                    vl_batch_id=batch_id,
+                )
+            )
+        return out
+
+    def replace_pending_returns(self, return_sides: dict[str, set[str]]) -> None:
+        """Replace pending return signals, pruning them once consumed."""
+        rows = [
+            (market, side)
+            for market, sides in return_sides.items()
+            for side in sides
+            if side in {"bid", "ask"}
+        ]
+        with self._db:
+            self._db.execute("DELETE FROM pending_returns")
+            self._db.executemany(
+                "INSERT OR REPLACE INTO pending_returns (market, side) VALUES (?, ?)",
+                rows,
+            )
+
+    def load_pending_returns(self) -> dict[str, set[str]]:
+        """Load unresolved return-side signals."""
+        out: dict[str, set[str]] = {}
+        for market, side in self._db.execute(
+            "SELECT market, side FROM pending_returns ORDER BY market, side"
+        ):
+            out.setdefault(market, set()).add(side)
+        return out
+
+
+def run(
+    *,
+    config_path: str | Path = "rotor/vl.config.toml",
+    poll_seconds: float = 305.0,
+    order_ttl_seconds: int = 600,
+    min_requote_seconds: float = 300.0,
+    max_reference_age_s: float | None = None,
+    dry_run: bool = False,
+    once: bool = False,
+    cancel_on_exit: bool = False,
+    telegram: bool = False,
+    auto_update: bool = False,
+    update_interval_seconds: float = DEFAULT_UPDATE_INTERVAL_SECONDS,
+    log_level: str = "WARNING",
+    state_path: str | Path | None = None,
+) -> int:
+    """Run the TOML-driven VL market maker."""
+    # Configure logging before boot so config/network failures are visible.
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.WARNING),
+        format="%(levelname).1s %(message)s",
+    )
+    log = logging.getLogger("rotor.mm.vl")
+    try:
+        # Load and validate TOML into typed strategy config.
+        config = load_vl_config(config_path)
+    except Exception as exc:
+        log.error("VL config failed: %s", exc)
+        return 1
+
+    try:
+        # Build the Sera client (dry-run uses a signer that must never be
+        # invoked); construction also rejects a non-TLS base URL. Bootstrap then
+        # loads signing domain, executor id, and markets; config limits refresh
+        # VL batch min/max.
+        client = build_client(dry_run=dry_run, log=log)
+        client.bootstrap()
+        client.get_config_limits()
+    except Exception as exc:
+        log.error("Sera bootstrap failed: %s", exc)
+        return 1
+
+    try:
+        # Convert static pair config into runtime objects with market metadata,
+        # algos, price oracles, and ISO symbols.
+        runtimes = _build_runtimes(
+            config,
+            client,
+            max_reference_age_s=max_reference_age_s,
+        )
+        # Ensure at least one configured budget can actually be spent by a pair.
+        _validate_budget_reachability(config, runtimes)
+    except Exception as exc:
+        log.error("VL boot config failed: %s", exc)
+        return 1
+    markets = {rt.config.market for rt in runtimes}
+
+    notifier = TelegramNotifier(log=log) if telegram else None
+    if notifier is not None:
+        notifier.notify_startup(
+            f"VL mm started pairs={len(runtimes)} "
+            f"budgets={','.join(sorted(config.budget_tokens))}"
+            f"{' (dry-run)' if dry_run else ''}"
+        )
+
+    updater = (
+        DailyGitUpdater(interval_seconds=update_interval_seconds)
+        if auto_update
+        else None
+    )
+    try:
+        state = None if dry_run else StateStore(state_path or _state_path())
+    except Exception as exc:
+        log.error("state store failed: %s", exc)
+        return 1
+
+    # Signal handlers flip the flag so finally cleanup can run.
+    stop = StopFlag()
+    stop.install()
+    # Reattach to any orders already resting on Sera for the configured markets
+    # so a restart does not orphan or duplicate live quotes. In dry-run we never
+    # touch live state.
+    stored_live = [] if state is None else state.load_active(markets)
+    live: list[LivePlacement] = [] if dry_run else _load_live_placements(
+        client,
+        markets,
+        log,
+        fallback=stored_live,
+        stop=stop,
+    )
+    if live and not dry_run:
+        if once:
+            # Fire-once (e.g. a Manus scheduler tick): do a single boot-cancel
+            # pass and never block on Sera's multi-minute cancel cooldown. Any
+            # orders still on cooldown stay tracked and the next scheduled run
+            # requotes them, so a single invocation always returns promptly.
+            live = _cancel_placements(client, live, log)
+        else:
+            live = _cancel_boot_placements(client, live, log, stop=stop)
+    if state is not None:
+        state.replace_active(live)
+
+    # return_sides: market -> sides that should quote at return_bps this tick.
+    return_sides: dict[str, set[str]] = (
+        {} if state is None else state.load_pending_returns()
+    )
+    restart_after_update = False
+    # Stall watchdog: alert the operator (once per window) when the loop has not
+    # placed a fresh quote set for a while because every tick is skipping
+    # (stale prices, fill-poll failures, a stuck cancel). The hourly heartbeat
+    # otherwise keeps reporting "alive" while nothing is being quoted.
+    stall_alert_seconds = max(poll_seconds * 3, 900.0)
+    last_quote_ok = time.time()
+    last_stall_alert = 0.0
+    try:
+        while not stop.requested:
+            # Record tick start so the loop can maintain poll cadence.
+            tick_started = time.time()
+            if notifier is not None:
+                notifier.heartbeat()
+                # Warn (throttled) when quoting has stalled for too long.
+                if (
+                    not dry_run
+                    and tick_started - last_quote_ok >= stall_alert_seconds
+                    and tick_started - last_stall_alert >= stall_alert_seconds
+                ):
+                    stalled_for = tick_started - last_quote_ok
+                    notifier.notify_error(
+                        "VL quoting stalled",
+                        RuntimeError(f"no successful placement for {stalled_for:.0f}s"),
+                    )
+                    last_stall_alert = tick_started
+            if updater is not None:
+                update_result = updater.run_if_due(log)
+                if update_result is not None and update_result.updated:
+                    restart_after_update = True
+                    log.warning("auto-update stopping VL loop before restart")
+                    break
+            # Phase 0: if we have no tracked state, try to recover open orders
+            # from Sera before quoting again (falls back to prior local state).
+            if not dry_run and not live:
+                live = _load_live_placements(
+                    client,
+                    markets,
+                    log,
+                    announce=False,
+                    fallback=(state.load_active(markets) if state is not None else live),
+                    stop=stop,
+                )
+                if state is not None:
+                    state.replace_active(live)
+            if dry_run:
+                tick_expiration = int(time.time()) + order_ttl_seconds
+            else:
+                try:
+                    tick_expiration = client.expiration_from_server_time(order_ttl_seconds)
+                except Exception as exc:
+                    log.warning("skip tick: server time unavailable: %s", exc)
+                    if once:
+                        return 1
+                    sleep_remaining(tick_started, poll_seconds, stop)
+                    continue
+            # Phase 1: poll fills on the resting quote set. A fill does not
+            # create an extra order; it marks the opposite side of the next
+            # normal quote set to use return_bps around the latest source mid.
+            if not dry_run and live:
+                try:
+                    fill_return_sides, filled_by_order_id = _poll_placement_fills(
+                        client,
+                        live,
+                        log,
+                    )
+                    _merge_return_sides(
+                        return_sides,
+                        fill_return_sides,
+                    )
+                    live = _prune_fully_filled_placements(
+                        live,
+                        filled_by_order_id,
+                        log,
+                    )
+                    if state is not None:
+                        state.replace_active(live)
+                    if state is not None:
+                        state.replace_pending_returns(return_sides)
+                except Exception as exc:
+                    log.warning("skip tick: fill polling failed: %s", exc)
+                    if once:
+                        return 1
+                    sleep_remaining(tick_started, poll_seconds, stop)
+                    continue
+
+            # Phase 2: ask each pair's algo for a fresh quote and flatten it
+            # into per-leg intents. Any return side uses latest source mid.
+            try:
+                intents = _build_tick_intents(
+                    config,
+                    runtimes,
+                    return_sides,
+                    expiration=tick_expiration,
+                    log=log,
+                )
+            except Exception as exc:
+                log.warning("skip tick: %s", exc)
+                if once:
+                    return 1
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
+            if not intents:
+                # No emitted sides means nothing can be safely placed this tick.
+                log.warning("skip tick: no emitted order intents")
+                if once:
+                    return 1
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
+            # Phase 3: reject the whole tick if any single leg would spend more
+            # than its configured per-token budget (a local sanity guard; Sera's
+            # shared vl_group budget is the authoritative cap).
+            try:
+                _validate_budget_caps(intents, config)
+            except Exception as exc:
+                log.warning("skip tick: %s", exc)
+                if once:
+                    return 1
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
+            # Phase 4: group legs by spent token; a group goes through VL only
+            # when its token is budgeted and it has >= vl_batch_min legs,
+            # otherwise each leg is placed standalone.
+            groups = group_intents(
+                intents, config.budget_tokens, client.vl_batch_min, client.vl_batch_max)
+            _log_groups(groups, log, dry_run=dry_run)
+
+            if dry_run:
+                # Dry-run logs grouping only; no signatures or cancellations.
+                if once:
+                    return 0
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
+            # Phase 5: local cancel-cooldown guard. With the default 305s cadence
+            # this normally passes, but it protects restarts and manually-shortened
+            # poll intervals.
+            live_orders = [
+                order for placement in live for order in placement.orders]
+            if live_orders and not all_requote_safe(live_orders, min_requote_seconds):
+                oldest_ready = min(
+                    order.placed_at + min_requote_seconds for order in live_orders
+                )
+                wait_s = max(0.0, oldest_ready - time.time())
+                log.debug("skip tick: waiting %.1fs for cancel cooldown guard", wait_s)
+                if once:
+                    return 0
+                sleep_remaining(tick_started, poll_seconds, stop)
+                continue
+
+            # Phase 6: cancel-first. Clear all resting placements before placing
+            # fresh ones so the new quotes cannot self-match (STP_BLOCKED) the
+            # old ones. If any cancel is still on cooldown, skip this tick.
+            if live:
+                live = _cancel_placements(client, live, log)
+                if state is not None:
+                    state.replace_active(live)
+                if live:
+                    if once:
+                        return 1
+                    sleep_remaining(tick_started, poll_seconds, stop)
+                    continue
+
+            # Phase 7: place exactly the fresh quote set. Placement fills only
+            # seed next tick's return sides; they never add extra live orders.
+            placed = _place_groups(client, groups, log)
+            if placed:
+                live = placed
+                try:
+                    return_sides = _return_sides_from_placement_fills(placed, log)
+                    live = _prune_fully_filled_placements(
+                        live,
+                        _filled_quantities_from_placement_fills(placed),
+                        log,
+                    )
+                except Exception as exc:
+                    log.warning("placement fill tracking failed: %s", exc)
+                    return_sides = {}
+                if state is not None:
+                    state.replace_active(live)
+                    state.replace_pending_returns(return_sides)
+                # A fresh quote set went out: reset the stall watchdog.
+                last_quote_ok = time.time()
+                if notifier is not None:
+                    notifier.notify_quote(
+                        "VL",
+                        bid="-",
+                        ask="-",
+                        qty=str(len(intents)),
+                        benchmark="multi",
+                    )
+            elif notifier is not None:
+                notifier.notify_error(
+                    "place VL quote", RuntimeError("VL placement failed"))
+            if once:
+                return 0 if placed else 1
+            sleep_remaining(tick_started, poll_seconds, stop)
+    finally:
+        # Shutdown cleanup cancels tracked placements in live mode. An
+        # auto-update restart always cancels first (even without --cancel-on-exit)
+        # so the next process does not boot into stale-priced resting quotes that
+        # could be picked off during the restart gap.
+        if (cancel_on_exit or restart_after_update) and live and not dry_run:
+            live = _cancel_placements(client, live, log)
+            if state is not None:
+                state.replace_active(live)
+        if notifier is not None:
+            notifier.notify_shutdown("VL mm stopped")
+        if state is not None:
+            state.close()
+        # Release the HTTP connection pool (best-effort; fakes may lack close()).
+        with contextlib.suppress(Exception):
+            client.close()
+    if restart_after_update:
+        try:
+            restart_current_process()
+        except Exception as exc:
+            log.error("auto-update restart failed: %s", exc)
+            return 1
+    return 0
+
+
+def _state_path() -> str:
+    """Return the unresolved-state database path."""
+    return str(get_config("ROTOR_STATE_PATH", DEFAULT_STATE_PATH) or DEFAULT_STATE_PATH)
+
+
+def group_intents(
+    intents: list[OrderIntent],
+    budget_tokens: set[str],
+    vl_min_size: int,
+    vl_max_size: int = 10**9,
+) -> list[tuple[str, list[OrderIntent], bool]]:
+    """Group intents by spent token and mark whether each group must use VL.
+
+    A same-spent-token group larger than Sera's batch maximum is split into
+    chunks of at most `vl_max_size` legs so an oversized group cannot make
+    `place_vl_batch` reject (and tear down) every tick.
+    """
+    # Spent token is the budget dimension Sera VL uses for shared collateral.
+    by_spent: dict[str, list[OrderIntent]] = {}
+    for intent in intents:
+        by_spent.setdefault(intent.spent_token, []).append(intent)
+    groups: list[tuple[str, list[OrderIntent], bool]] = []
+    for spent_token, rows in sorted(by_spent.items()):
+        budgeted = spent_token in budget_tokens
+        if not budgeted or len(rows) < vl_min_size:
+            # Singleton or unbudgeted groups place standalone.
+            groups.append((spent_token, rows, False))
+            continue
+        # Budgeted, VL-eligible group: chunk so no batch exceeds Sera's maximum.
+        for start in range(0, len(rows), vl_max_size):
+            chunk = rows[start:start + vl_max_size]
+            # A trailing chunk below the batch minimum places standalone.
+            groups.append((spent_token, chunk, len(chunk) >= vl_min_size))
+    return groups
+
+
+def _build_runtimes(
+    config: VLConfig,
+    client: SeraClient,
+    *,
+    max_reference_age_s: float | None,
+) -> list[PairRuntime]:
+    """Build runtime objects for every configured pair."""
+    # Token-to-ISO mapping is loaded once and reused for all configured pairs.
+    token_to_iso = load_token_to_iso()
+    # Reuse one source adapter per provider name to avoid duplicate HTTP clients.
+    source_cache = {}
+    runtimes: list[PairRuntime] = []
+    for pair in config.pairs:
+        # Each configured market must be present in Sera's bootstrapped cache.
+        info = client.markets_by_symbol.get(pair.market)
+        if info is None:
+            raise ValueError(
+                f"Sera market {pair.market} not available "
+                f"(available={sorted(client.markets_by_symbol)})"
+            )
+        # Reference providers work in ISO symbols, not Sera token symbols.
+        iso_base, iso_quote = market_to_iso_pair(pair.market, token_to_iso)
+        # Construct each provider adapter once per price_source.
+        if pair.price_source not in source_cache:
+            source_cache[pair.price_source] = load_price_reference_source(pair.price_source)
+        source = source_cache[pair.price_source]
+        # Build one algo per pair because pair sizes/spreads may differ.
+        algo = build_algo(
+            qty_base=pair.qty_base,
+            fixed_bps=pair.fixed_bps,
+        )
+        # Store all runtime dependencies needed by the tick builder.
+        runtimes.append(
+            PairRuntime(
+                config=pair,
+                info=info,
+                algo=algo,
+                oracle=ReferencePriceOracle(
+                    source, max_age_s=max_reference_age_s),
+                iso_base=iso_base,
+                iso_quote=iso_quote,
+            )
+        )
+    return runtimes
+
+
+def _validate_budget_reachability(config: VLConfig, runtimes: list[PairRuntime]) -> None:
+    """Ensure configured budgets overlap with tokens a pair can actually spend."""
+    possible = set()
+    for runtime in runtimes:
+        # Bids spend quote; asks spend base, so both symbols can be spent.
+        possible.add(runtime.info.quote_symbol.upper())
+        possible.add(runtime.info.base_symbol.upper())
+    # At least one budget must match a spend token or VL grouping can never occur.
+    if not (config.budget_tokens & possible):
+        raise ValueError(
+            "at least one [[budget]] token must match a configured market's "
+            f"base/quote spent token; budgets={sorted(config.budget_tokens)} "
+            f"possible={sorted(possible)}"
+        )
+
+
+def _validate_budget_caps(intents: list[OrderIntent], config: VLConfig) -> None:
+    """Reject when the aggregate spend of a token's intents exceeds its budget."""
+    # Convert list config into quick lookup by token symbol.
+    budgets = {budget.token: budget.amount for budget in config.budgets}
+    # Sum spend per token: several markets can share one spent token, so a
+    # per-intent check would let their combined spend exceed the local budget.
+    spend_by_token: dict[str, Decimal] = {}
+    for intent in intents:
+        if intent.spent_token not in budgets:
+            # Unbudgeted tokens may still place standalone orders.
+            continue
+        spend_by_token[intent.spent_token] = (
+            spend_by_token.get(intent.spent_token, Decimal("0"))
+            + _intent_spend_amount(intent)
+        )
+    for token, spend in spend_by_token.items():
+        budget = budgets[token]
+        if spend > budget:
+            raise ValueError(
+                f"{token} intents spend {fmt(spend)} in aggregate, "
+                f"above configured budget {fmt(budget)}"
+            )
+
+
+def _intent_spend_amount(intent: OrderIntent) -> Decimal:
+    """Return the amount of spent_token consumed by an intent."""
+    # Bids spend quote notional: base quantity times quote-per-base price.
+    if intent.side == "bid":
+        return intent.qty_base * intent.price
+    # Asks spend/sell base quantity.
+    return intent.qty_base
+
+
+def _build_tick_intents(
+    config: VLConfig,
+    runtimes: list[PairRuntime],
+    return_sides: dict[str, set[str]],
+    *,
+    expiration: int,
+    log: logging.Logger,
+) -> list[OrderIntent]:
+    """Build all order intents for one loop tick.
+
+    Each pair is isolated: a stale/unavailable reference or a quote that fails
+    market minimums skips only that pair, so one misbehaving market cannot
+    sideline quoting on every other healthy market.
+    """
+    out: list[OrderIntent] = []
+    for runtime in runtimes:
+        try:
+            out.extend(
+                _intents_for_runtime(
+                    runtime, return_sides, config.return_bps,
+                    expiration=expiration, log=log,
+                )
+            )
+        except Exception as exc:
+            log.warning("skip pair %s: %s", runtime.config.market, exc)
+    return out
+
+
+def _intents_for_runtime(
+    runtime: PairRuntime,
+    return_sides: dict[str, set[str]],
+    return_bps: Decimal,
+    *,
+    expiration: int,
+    log: logging.Logger,
+) -> list[OrderIntent]:
+    """Build order intents for a single configured pair."""
+    # Fetch a fresh reference for this pair, priced for the worked base size so
+    # amount-aware sources (Wise) reflect the fee for this amount.
+    ref = runtime.oracle.get(
+        runtime.iso_base, runtime.iso_quote, amount=runtime.config.qty_base
+    )
+    # Build the fixed-spread quote from the latest source mid.
+    quote = dispatch_quote(runtime.algo, runtime.info, ref.rate)
+    sides = return_sides.get(runtime.config.market, set())
+    quote = _quote_with_return_sides(
+        runtime.info,
+        quote,
+        sides,
+        return_bps,
+    )
+    return_text = _return_side_text(sides, return_bps)
+    # Debug-only per-pair quote trace for operators and audits.
+    log.debug(
+        "%s algo=%s benchmark=%s fixed_bps=%s bid=%s ask=%s qty=%s "
+        "src=%s%s",
+        runtime.config.market,
+        runtime.algo.name,
+        fmt(quote.benchmark_rate),
+        fmt(quote.fixed_bps),
+        fmt_optional(quote.bid_price),
+        fmt_optional(quote.ask_price),
+        fmt(quote.qty_base),
+        ref.source,
+        return_text,
+    )
+    # Flatten the two-sided quote into concrete order intents.
+    return _intents_from_quote(
+        runtime.config.market, runtime.info, quote, expiration)
+
+
+def _intents_from_quote(
+    market: str,
+    info,
+    quote: QuoteSet,
+    expiration: int,
+) -> list[OrderIntent]:
+    """Convert a quote set into zero, one, or two order intents."""
+    out: list[OrderIntent] = []
+    if quote.bid_price is not None:
+        # A bid spends quote tokens and buys base.
+        out.append(
+            OrderIntent(
+                market=market,
+                side="bid",
+                qty_base=quote.qty_base,
+                price=quote.bid_price,
+                expiration=expiration,
+                spent_token=info.quote_symbol.upper(),
+                benchmark_rate=quote.benchmark_rate,
+            )
+        )
+    if quote.ask_price is not None:
+        # An ask spends/sells base tokens and receives quote.
+        out.append(
+            OrderIntent(
+                market=market,
+                side="ask",
+                qty_base=quote.qty_base,
+                price=quote.ask_price,
+                expiration=expiration,
+                spent_token=info.base_symbol.upper(),
+                benchmark_rate=quote.benchmark_rate,
+            )
+        )
+    return out
+
+
+def _quote_with_return_sides(
+    info,
+    quote: QuoteSet,
+    sides: set[str],
+    return_bps: Decimal,
+) -> QuoteSet:
+    """Tighten filled-return sides while preserving the algo's other outputs."""
+    active = {side for side in sides if side in {"bid", "ask"}}
+    if not active:
+        return quote
+    tight = SimpleMarketMakingAlgo(
+        SimpleMarketMakingConfig(qty_base=quote.qty_base, fixed_bps=return_bps)
+    ).quote(info, quote.benchmark_rate)
+    return QuoteSet(
+        benchmark_rate=quote.benchmark_rate,
+        bid_price=(
+            tight.bid_price
+            if "bid" in active and quote.bid_price is not None else quote.bid_price
+        ),
+        ask_price=(
+            tight.ask_price
+            if "ask" in active and quote.ask_price is not None else quote.ask_price
+        ),
+        qty_base=quote.qty_base,
+        fixed_bps=quote.fixed_bps,
+    )
+
+
+def _place_groups(
+    client: SeraClient,
+    groups: list[tuple[str, list[OrderIntent], bool]],
+    log: logging.Logger,
+) -> list[LivePlacement]:
+    """Place grouped intents and return local live-placement records."""
+    placed: list[LivePlacement] = []
+    try:
+        for spent_token, intents, use_vl in groups:
+            if use_vl:
+                # VL batches submit sibling legs that share one spent-token budget.
+                result = client.place_vl_batch([
+                    VLLeg(
+                        market=i.market,
+                        side=i.side,
+                        qty_base=i.qty_base,
+                        price=i.price,
+                        expiration=i.expiration,
+                    )
+                    for i in intents
+                ])
+                # Convert Sera's batch response into local cancellation/fill state.
+                placement = _placement_from_vl_result(
+                    spent_token, result, intents)
+                placed.append(placement)
+                log.debug(
+                    "placed VL batch %s spent=%s legs=%d amendments=%d cancelled=%d fills=%d",
+                    result.vl_batch_id,
+                    spent_token,
+                    len(result.records),
+                    len(result.amendments),
+                    len(result.cancelled),
+                    len(result.fills),
+                )
+            else:
+                for intent in intents:
+                    # Singletons and unbudgeted groups place as ordinary orders.
+                    record = client.place_order_previewed(
+                        intent.market,
+                        intent.side,
+                        intent.qty_base,
+                        intent.price,
+                        intent.expiration,
+                    )
+                    placed.append(
+                        LivePlacement(
+                            kind="standalone",
+                            spent_token=intent.spent_token,
+                            orders=[_live_from_record(
+                                intent.market,
+                                intent.side,
+                                record,
+                                qty_base=intent.qty_base,
+                            )],
+                            placed_at=time.time(),
+                            # Track the source intent so a fill on this
+                            # standalone order can tighten the opposite side on
+                            # the next cadence quote.
+                            intent_by_order_id={record.order_id: intent},
+                        )
+                    )
+                    # Reason helps operators understand why VL was not used.
+                    reason = (
+                        "singleton"
+                        if len(intents) < client.vl_batch_min else "unbudgeted"
+                    )
+                    log.debug(
+                        "placed standalone %s %s side=%s spent=%s reason=%s",
+                        intent.market,
+                        record.order_id,
+                        intent.side,
+                        intent.spent_token,
+                        reason,
+                    )
+    except Exception as exc:
+        # Any failure aborts the whole tick; partial placements are cancelled so
+        # exposure does not remain half-updated.
+        log.error("placement failed: %s", exc)
+        if placed:
+            log.warning("cancelling partial VL tick placements")
+            _cancel_placements(client, placed, log)
+        return []
+    return placed
+
+
+def _placement_from_vl_result(
+    spent_token: str,
+    result: VLBatchResult,
+    intents: list[OrderIntent],
+) -> LivePlacement:
+    """Convert Sera's VL batch result into local live-placement state."""
+    # Use one timestamp for every sibling so cooldown checks are consistent.
+    now = time.time()
+    # Legs Sera dropped at placement never rest; do not track them as live.
+    cancelled_ids = {leg.order_id for leg in result.cancelled if leg.order_id}
+    # Sera may clip a leg's size; track the accepted (amended) amount so a full
+    # fill at the clipped size is recognized and pruned.
+    amended = {
+        a.order_id: Decimal(str(a.actual_amount))
+        for a in result.amendments
+        if a.order_id and a.actual_amount not in (None, "")
+    }
+    # Map returned order ids back to their source intents for fill-side tracking.
+    rows = list(zip(result.records, intents, strict=False))
+    orders: list[LiveOrder] = []
+    intent_by_order_id: dict[str, OrderIntent] = {}
+    for record, intent in rows:
+        if record.order_id in cancelled_ids:
+            continue
+        intent_by_order_id[record.order_id] = intent
+        orders.append(
+            LiveOrder(
+                side=intent.side,
+                order_id=record.order_id,
+                uuid_int=record.uuid_int,
+                placed_at=now,
+                market=intent.market,
+                qty_base=amended.get(record.order_id, intent.qty_base),
+            )
+        )
+    return LivePlacement(
+        kind="vl",
+        spent_token=spent_token,
+        orders=orders,
+        placed_at=now,
+        vl_batch_id=result.vl_batch_id,
+        fills=result.fills,
+        intent_by_order_id=intent_by_order_id,
+    )
+
+
+def _cancel_placements(
+    client: SeraClient,
+    placements: list[LivePlacement],
+    log: logging.Logger,
+) -> list[LivePlacement]:
+    """Cancel live placements and return placements that remain live."""
+    remaining: list[LivePlacement] = []
+    for placement in placements:
+        if placement.kind == "vl" and placement.vl_batch_id:
+            try:
+                # VL batches are cancelled by batch id instead of each child.
+                ok = client.cancel_vl_batch(placement.vl_batch_id)
+            except Exception as exc:
+                if _is_order_gone(exc):
+                    # Already gone (expired/filled/unknown): drop it so it cannot
+                    # wedge the cancel-first loop forever.
+                    log.warning("VL batch %s already gone; dropping: %s",
+                                placement.vl_batch_id, exc)
+                    continue
+                # Other (retryable) errors keep the placement tracked for retry.
+                log.warning("cancel VL batch failed %s: %s",
+                            placement.vl_batch_id, exc)
+                remaining.append(placement)
+                continue
+            if ok:
+                log.debug("cancelled VL batch %s", placement.vl_batch_id)
+            else:
+                # Cooldown is not fatal; runner will wait and retry later.
+                log.debug("cancel cooldown VL batch %s", placement.vl_batch_id)
+                remaining.append(placement)
+            continue
+
+        # Standalone placements cancel each live order separately.
+        leftover: list[LiveOrder] = []
+        for order in placement.orders:
+            try:
+                ok = client.cancel_order(order.order_id, order.uuid_int)
+            except Exception as exc:
+                if _is_order_gone(exc):
+                    # Order no longer exists on Sera; stop tracking it.
+                    log.warning("order %s %s already gone; dropping: %s",
+                                order.side, order.order_id, exc)
+                    continue
+                # Keep failed orders in the placement so tracking is not lost.
+                log.warning("cancel failed %s %s: %s",
+                            order.side, order.order_id, exc)
+                leftover.append(order)
+                continue
+            if ok:
+                log.debug("cancelled %s %s", order.side, order.order_id)
+            else:
+                # Cooldown means this order is still live.
+                log.debug("cancel cooldown %s %s", order.side, order.order_id)
+                leftover.append(order)
+        if leftover:
+            # Mutate the placement to contain only orders that still need tracking.
+            placement.orders = leftover
+            remaining.append(placement)
+    return remaining
+
+
+def _is_order_gone(exc: Exception) -> bool:
+    """Return True when a cancel error means the order no longer exists on Sera.
+
+    A 404 (or a typed code about a missing/already-resolved order) means the
+    order expired, filled, or was already cancelled — retaining it would block
+    all future quoting. Genuinely retryable errors (5xx, network, cooldown) are
+    NOT treated as gone, so a maybe-live order is never dropped prematurely.
+    """
+    if not isinstance(exc, errors.SeraError):
+        return False
+    if exc.status_code == 404:
+        return True
+    code = (exc.error_code or "").upper()
+    return any(
+        marker in code
+        for marker in ("NOT_FOUND", "ALREADY_CANCEL", "ALREADY_FILLED", "ORDER_GONE", "UNKNOWN_ORDER")
+    )
+
+
+def _cancel_boot_placements(
+    client: SeraClient,
+    placements: list[LivePlacement],
+    log: logging.Logger,
+    *,
+    wait_seconds: float = BOOT_CANCEL_RETRY_SECONDS,
+    stop: StopFlag | None = None,
+) -> list[LivePlacement]:
+    """Cancel startup placements, waiting once for Sera's cooldown if needed."""
+    remaining = _cancel_placements(client, placements, log)
+    if not remaining:
+        return []
+    log.warning(
+        "boot cancel has %d placement(s) still live; waiting %.0fs before retry",
+        len(remaining),
+        wait_seconds,
+    )
+    # Wait interruptibly so SIGINT/SIGTERM during boot does not block for minutes.
+    if stop is not None:
+        if stop.wait(wait_seconds):
+            return remaining
+    else:
+        time.sleep(wait_seconds)
+    return _cancel_placements(client, remaining, log)
+
+
+def _load_live_placements(
+    client: SeraClient,
+    markets: set[str],
+    log: logging.Logger,
+    *,
+    announce: bool = True,
+    fallback: list[LivePlacement] | None = None,
+    retries: int = 2,
+    retry_wait: float = 2.0,
+    stop: StopFlag | None = None,
+) -> list[LivePlacement]:
+    """Reattach open orders from Sera for configured markets.
+
+    A transient reattach failure is retried before falling back to local state:
+    if orders were placed just before a crash and the boot reattach blips, a bare
+    fallback to empty local state would orphan them (live on Sera, untracked).
+    """
+    rows = None
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            # Pull current open orders for the owner.
+            rows = client.get_open_orders()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                if stop is not None and stop.wait(retry_wait):
+                    break
+                if stop is None:
+                    time.sleep(retry_wait)
+    if rows is None:
+        log.warning(
+            "could not reattach open VL orders after %d attempt(s): %s",
+            retries + 1,
+            last_exc,
+        )
+        # Preserve caller fallback so transient API failure does not orphan state.
+        return list(fallback or [])
+
+    standalone: list[LivePlacement] = []
+    batches: dict[str, list[LiveOrder]] = {}
+    for row in rows:
+        # Accept both `symbol` and `market` response keys.
+        market = str(row.get("symbol") or row.get("market") or "").upper()
+        if market not in markets:
+            continue
+        # Accept only bid/ask orders with enough ids to cancel later.
+        side = str(row.get("side") or "").lower()
+        order_id = row.get("trade_id") or row.get("order_id")
+        uuid_int = row.get("uuid_int")
+        if side not in ("bid", "ask") or not order_id or not uuid_int:
+            continue
+        # Preserve server creation time when available for cooldown math.
+        live_order = LiveOrder(
+            side=side,
+            order_id=str(order_id),
+            uuid_int=int(uuid_int),
+            placed_at=parse_ts(row.get("created_at")) or time.time(),
+            market=market,
+            qty_base=_open_order_qty_base(row),
+        )
+        # Orders with a batch id are grouped into one VL placement.
+        vl_batch_id = str(row.get("vl_batch_id") or "").strip()
+        if vl_batch_id:
+            batches.setdefault(vl_batch_id, []).append(live_order)
+        else:
+            # Standalone orders become one-order placements.
+            standalone.append(
+                LivePlacement(
+                    kind="standalone",
+                    spent_token="",
+                    orders=[live_order],
+                    placed_at=live_order.placed_at,
+                )
+            )
+
+    # Start output with standalone placements, then append reconstructed batches.
+    out = list(standalone)
+    for vl_batch_id, orders in batches.items():
+        # Batch placed_at is the oldest sibling time for cooldown purposes.
+        out.append(
+            LivePlacement(
+                kind="vl",
+                spent_token="",
+                orders=orders,
+                placed_at=min(o.placed_at for o in orders),
+                vl_batch_id=vl_batch_id,
+            )
+        )
+    # Reattached placements have no intent_by_order_id, but each LiveOrder keeps
+    # enough market/side metadata to let fills tighten the next cadence quote.
+    if out and announce:
+        log.debug("reattached %d open placement(s)", len(out))
+    return out
+
+
+def _return_sides_from_placement_fills(
+    placements: list[LivePlacement],
+    log: logging.Logger,
+) -> dict[str, set[str]]:
+    """Read immediate placement fills and mark sides to tighten next tick."""
+    out: dict[str, set[str]] = {}
+    for placement in placements:
+        if not placement.fills:
+            continue
+        for fill in placement.fills:
+            order_id = str(fill.get("order_id") or "")
+            order = _find_live_order(placement, order_id)
+            source = (
+                (placement.intent_by_order_id or {}).get(order_id)
+                if order_id else None
+            )
+            _record_return_side(out, order, source, fill, log)
+    return out
+
+
+def _return_sides_from_polled_fills(
+    client: SeraClient,
+    placements: list[LivePlacement],
+    log: logging.Logger,
+) -> dict[str, set[str]]:
+    """Poll Sera for fills and mark sides to tighten on the next quote set."""
+    return _poll_placement_fills(client, placements, log)[0]
+
+
+def _poll_placement_fills(
+    client: SeraClient,
+    placements: list[LivePlacement],
+    log: logging.Logger,
+) -> tuple[dict[str, set[str]], dict[str, Decimal]]:
+    """Poll fills and return both return-side signals and filled quantities."""
+    out: dict[str, set[str]] = {}
+    filled_by_order_id: dict[str, Decimal] = {}
+    for placement in placements:
+        for order in placement.orders:
+            source = (placement.intent_by_order_id or {}).get(order.order_id)
+            # Poll fills for each tracked source order.
+            fills = client.get_order_fills(order.order_id)
+            for fill in fills:
+                qty_base = _filled_base_qty(fill)
+                if qty_base > 0:
+                    filled_by_order_id[order.order_id] = (
+                        filled_by_order_id.get(order.order_id, Decimal("0"))
+                        + qty_base
+                    )
+                _record_return_side(out, order, source, fill, log)
+    return out, filled_by_order_id
+
+
+def _filled_quantities_from_placement_fills(
+    placements: list[LivePlacement],
+) -> dict[str, Decimal]:
+    """Return fill quantities from immediate placement responses."""
+    out: dict[str, Decimal] = {}
+    for placement in placements:
+        if not placement.fills:
+            continue
+        for fill in placement.fills:
+            order_id = str(fill.get("order_id") or "")
+            if not order_id:
+                continue
+            qty_base = _filled_base_qty(fill)
+            if qty_base > 0:
+                out[order_id] = out.get(order_id, Decimal("0")) + qty_base
+    return out
+
+
+def _prune_fully_filled_placements(
+    placements: list[LivePlacement],
+    filled_by_order_id: dict[str, Decimal],
+    log: logging.Logger,
+) -> list[LivePlacement]:
+    """Drop locally known fully filled orders from unresolved active state."""
+    if not filled_by_order_id:
+        return placements
+    remaining: list[LivePlacement] = []
+    for placement in placements:
+        leftover: list[LiveOrder] = []
+        for order in placement.orders:
+            filled = filled_by_order_id.get(order.order_id, Decimal("0"))
+            if order.qty_base is not None and filled >= order.qty_base:
+                log.debug(
+                    "pruned fully filled %s %s qty=%s",
+                    order.side,
+                    order.order_id,
+                    fmt(filled),
+                )
+                continue
+            leftover.append(order)
+        if leftover:
+            placement.orders = leftover
+            remaining.append(placement)
+    return remaining
+
+
+def _record_return_side(
+    out: dict[str, set[str]],
+    order: LiveOrder | None,
+    source: OrderIntent | None,
+    fill: dict,
+    log: logging.Logger,
+) -> None:
+    """Turn one positive fill into a market/side return signal."""
+    qty_base = _filled_base_qty(fill)
+    if qty_base <= 0:
+        return
+    order_id = str(fill.get("order_id") or (order.order_id if order else ""))
+    market = source.market if source is not None else (order.market if order else "")
+    side = source.side if source is not None else (order.side if order else "")
+    if not market or side not in {"bid", "ask"}:
+        log.warning("cannot mark return side: unknown filled order_id=%s", order_id)
+        return
+    return_side = "ask" if side == "bid" else "bid"
+    out.setdefault(market, set()).add(return_side)
+    log.debug(
+        "fill marked return side order=%s market=%s filled_side=%s return_side=%s qty=%s",
+        order_id,
+        market,
+        side,
+        return_side,
+        fmt(qty_base),
+    )
+
+
+def _find_live_order(placement: LivePlacement, order_id: str) -> LiveOrder | None:
+    """Find a live order by id inside one placement."""
+    for order in placement.orders:
+        if order.order_id == order_id:
+            return order
+    return None
+
+
+def _merge_return_sides(
+    target: dict[str, set[str]],
+    source: dict[str, set[str]],
+) -> None:
+    """Merge newly found fill signals into the pending quote-side map."""
+    for market, sides in source.items():
+        target.setdefault(market, set()).update(sides)
+
+
+def _filled_base_qty(fill: dict) -> Decimal:
+    """Extract filled base quantity from known Sera fill response shapes."""
+    # Some responses provide nested trade rows; sum their quantities.
+    trades = fill.get("trades")
+    if isinstance(trades, list):
+        total = Decimal("0")
+        for trade in trades:
+            if isinstance(trade, dict):
+                total += Decimal(str(trade.get("quantity", "0")))
+        return total
+    # Other responses expose a flat amount-like field.
+    for key in ("filled_base_amount", "quantity", "amount"):
+        if fill.get(key) is not None:
+            return Decimal(str(fill[key]))
+    # Missing amount is treated as zero and ignored by callers.
+    return Decimal("0")
+
+
+def _open_order_qty_base(row: dict) -> Decimal | None:
+    """Extract an open order's base size when Sera exposes it."""
+    for key in ("qty_base", "base_amount", "quantity", "amount"):
+        value = row.get(key)
+        if value is not None:
+            return Decimal(str(value))
+    return None
+
+
+def _log_groups(
+    groups: list[tuple[str, list[OrderIntent], bool]],
+    log: logging.Logger,
+    *,
+    dry_run: bool,
+) -> None:
+    """Log the placement path and economics for every order intent."""
+    for spent_token, intents, use_vl in groups:
+        # Path tells whether this intent will be placed via VL or standalone.
+        path = "VL" if use_vl else "standalone"
+        for intent in intents:
+            log.debug(
+                "%sintent %s %s side=%s spent=%s price=%s qty=%s",
+                "dry-run " if dry_run else "",
+                path,
+                intent.market,
+                intent.side,
+                spent_token,
+                fmt(intent.price),
+                fmt(intent.qty_base),
+            )
+
+
+def _live_from_record(
+    market: str,
+    side: str,
+    record: OrderRecord,
+    *,
+    qty_base: Decimal | None = None,
+) -> LiveOrder:
+    """Convert a placed order record into local live-order state."""
+    return LiveOrder(
+        side=side,
+        order_id=record.order_id,
+        uuid_int=record.uuid_int,
+        placed_at=time.time(),
+        market=market,
+        qty_base=qty_base,
+    )
+
+
+def _return_side_text(sides: set[str], return_bps: Decimal) -> str:
+    """Format optional return-side state for quote logs."""
+    active = sorted(side for side in sides if side in {"bid", "ask"})
+    if not active:
+        return ""
+    return f" return_sides={','.join(active)} return_bps={fmt(return_bps)}"

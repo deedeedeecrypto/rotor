@@ -1,0 +1,12 @@
+"""Sera exchange client helpers.
+
+Modules:
+    client:  REST wrapper for config, health, markets, order preview/place,
+             cancel, and open-order reads.
+    eip712:  Typed-data definitions for `Order`, `CancelOrder`, plus the
+             `uuid_int` bit-packing helper.
+    errors:  `SeraError` + `SeraCancelCooldown` typed envelope parser.
+"""
+
+# This package marker documents the exchange layer but intentionally avoids
+# imports so HTTP/signing dependencies load only from their concrete modules.

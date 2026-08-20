@@ -1,0 +1,102 @@
+[
+  {
+    "symbol": "GYEN/EURT",
+    "side": "bid",
+    "amount": "5000",
+    "price": "1.275",
+    "base_address": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+    "quote_address": "0x02aa41876fe62da9e28fe8a970a5dfa3dfdabf07",
+    "base_decimals": 6,
+    "quote_decimals": 6,
+    "owner_address": "0x1111111111111111111111111111111111111111",
+    "uuid_int": "1178598107236185917212234515958980847615267721667146583793412321256683462656",
+    "expiration": 1786036366,
+    "expected_struct": {
+      "user": "0x1111111111111111111111111111111111111111",
+      "expiration": "1786036366",
+      "feeBps": "0",
+      "recipient": "0x0000000000000000000000000000000000000000",
+      "fromToken": "0x02aa41876fe62da9e28fe8a970a5dfa3dfdabf07",
+      "toToken": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+      "fromAmount": "6375000000",
+      "toAmount": "5000000000",
+      "initialDepositAmount": "0",
+      "uuid": "1178598107236185917212234515958980847615267721667146583793412321256683462656"
+    }
+  },
+  {
+    "symbol": "GYEN/EURT",
+    "side": "ask",
+    "amount": "100000",
+    "price": "0.5",
+    "base_address": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+    "quote_address": "0x02aa41876fe62da9e28fe8a970a5dfa3dfdabf07",
+    "base_decimals": 6,
+    "quote_decimals": 6,
+    "owner_address": "0x1111111111111111111111111111111111111111",
+    "uuid_int": "4851947774138776114604411097700084638136622789841893280129722147180390895616",
+    "expiration": 1786036366,
+    "expected_struct": {
+      "user": "0x1111111111111111111111111111111111111111",
+      "expiration": "1786036366",
+      "feeBps": "0",
+      "recipient": "0x0000000000000000000000000000000000000000",
+      "fromToken": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+      "toToken": "0x02aa41876fe62da9e28fe8a970a5dfa3dfdabf07",
+      "fromAmount": "100000000000",
+      "toAmount": "50000000000",
+      "initialDepositAmount": "0",
+      "uuid": "4851947774138776114604411097700084638136622789841893280129722147180390895616"
+    }
+  },
+  {
+    "symbol": "ARC/THBK",
+    "side": "bid",
+    "amount": "2500.5",
+    "price": "0.813",
+    "base_address": "0xc560f9895b482b6a2c8782bb63a4785a4e049eec",
+    "quote_address": "0xcdd003626b02b0bdfaf11b1c9ae37d63d4fb73cb",
+    "base_decimals": 2,
+    "quote_decimals": 6,
+    "owner_address": "0x1111111111111111111111111111111111111111",
+    "uuid_int": "2353204885959003420097886542211439080746153695760928842749109421681045225472",
+    "expiration": 1786036366,
+    "expected_struct": {
+      "user": "0x1111111111111111111111111111111111111111",
+      "expiration": "1786036366",
+      "feeBps": "0",
+      "recipient": "0x0000000000000000000000000000000000000000",
+      "fromToken": "0xcdd003626b02b0bdfaf11b1c9ae37d63d4fb73cb",
+      "toToken": "0xc560f9895b482b6a2c8782bb63a4785a4e049eec",
+      "fromAmount": "2032906500",
+      "toAmount": "250050",
+      "initialDepositAmount": "0",
+      "uuid": "2353204885959003420097886542211439080746153695760928842749109421681045225472"
+    }
+  },
+  {
+    "symbol": "GYEN/ARC",
+    "side": "bid",
+    "amount": "1000",
+    "price": "1.28",
+    "base_address": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+    "quote_address": "0xc560f9895b482b6a2c8782bb63a4785a4e049eec",
+    "base_decimals": 6,
+    "quote_decimals": 2,
+    "owner_address": "0x1111111111111111111111111111111111111111",
+    "uuid_int": "5680105061591715877336712341851764348670357459001375848290966611853047275520",
+    "expiration": 1786036366,
+    "expected_struct": {
+      "user": "0x1111111111111111111111111111111111111111",
+      "expiration": "1786036366",
+      "feeBps": "0",
+      "recipient": "0x0000000000000000000000000000000000000000",
+      "fromToken": "0xc560f9895b482b6a2c8782bb63a4785a4e049eec",
+      "toToken": "0x013be8de57f99c1345f629fe4c8dd2a52c2a32a9",
+      "fromAmount": "128000",
+      "toAmount": "1000000000",
+      "initialDepositAmount": "0",
+      "uuid": "5680105061591715877336712341851764348670357459001375848290966611853047275520"
+    }
+  }
+]

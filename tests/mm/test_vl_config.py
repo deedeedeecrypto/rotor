@@ -1,0 +1,115 @@
+"""Tests for TOML parsing and validation of VL market-maker config."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+
+import pytest
+
+from rotor.mm.vl_config import parse_vl_config
+
+
+def _config(**overrides):
+    raw = {
+        "budget": [{"token": "USDC", "amount": "5000"}],
+        "fixed_bps": "8",
+        "return_bps": "1",
+        "pair": [
+            {"market": "XSGD/USDC", "price_source": "wise", "qty_base": "1000"},
+            {
+                "market": "EURC/USDC",
+                "price_source": "ecb",
+                "qty_base": "500",
+                "fixed_bps": "6",
+            },
+        ],
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_parse_vl_config_accepts_multi_budget_toml_shape():
+    cfg = parse_vl_config(_config(budget=[
+        {"token": "USDC", "amount": "5000"},
+        {"token": "XSGD", "amount": "1000"},
+    ]))
+
+    assert cfg.return_bps == Decimal("1")
+    assert cfg.budget_tokens == {"USDC", "XSGD"}
+    assert cfg.pairs[0].market == "XSGD/USDC"
+    assert cfg.pairs[1].fixed_bps == Decimal("6")
+
+
+def test_parse_vl_config_rejects_duplicate_or_inverse_markets():
+    with pytest.raises(ValueError, match="duplicate or inverse"):
+        parse_vl_config(_config(pair=[
+            {"market": "XSGD/USDC", "qty_base": "100"},
+            {"market": "USDC/XSGD", "qty_base": "100"},
+        ]))
+
+
+def test_parse_vl_config_rejects_non_positive_return_bps():
+    with pytest.raises(ValueError, match="return_bps must be > 0"):
+        parse_vl_config(_config(return_bps="0"))
+
+
+def test_parse_vl_config_rejects_missing_budget():
+    with pytest.raises(ValueError, match="budget"):
+        parse_vl_config(_config(budget=[]))
+
+
+def test_parse_vl_config_rejects_unsupported_price_source():
+    with pytest.raises(ValueError, match="unsupported price_source 'manual'"):
+        parse_vl_config(_config(pair=[
+            {"market": "XSGD/USDC", "price_source": "manual", "qty_base": "100"},
+        ]))
+
+
+def test_parse_vl_config_rejects_non_positive_budget_amount():
+    with pytest.raises(ValueError, match="budget USDC amount must be > 0"):
+        parse_vl_config(_config(budget=[{"token": "USDC", "amount": "0"}]))
+
+
+def test_parse_vl_config_rejects_duplicate_budget_token():
+    with pytest.raises(ValueError, match="duplicate budget token USDC"):
+        parse_vl_config(_config(budget=[
+            {"token": "USDC", "amount": "1"},
+            {"token": "usdc", "amount": "2"},
+        ]))
+
+
+def test_parse_vl_config_rejects_missing_pair():
+    with pytest.raises(ValueError, match="at least one \\[\\[pair\\]\\]"):
+        parse_vl_config(_config(pair=[]))
+
+
+def test_parse_vl_config_rejects_non_positive_pair_quantity():
+    with pytest.raises(ValueError, match="qty_base must be > 0"):
+        parse_vl_config(_config(pair=[
+            {"market": "XSGD/USDC", "price_source": "wise", "qty_base": "0"},
+        ]))
+
+
+def test_parse_vl_config_rejects_invalid_decimal():
+    with pytest.raises(ValueError, match="fixed_bps must be decimal"):
+        parse_vl_config(_config(fixed_bps="not-decimal"))
+
+
+def test_parse_vl_config_normalizes_market_names():
+    cfg = parse_vl_config(_config(pair=[
+        {"market": "xsgd_usdc", "price_source": "wise", "qty_base": "100"},
+    ]))
+
+    assert cfg.pairs[0].market == "XSGD/USDC"
+
+
+def test_parse_vl_config_pair_overrides_inherit_global_defaults():
+    cfg = parse_vl_config(_config(
+        fixed_bps="9",
+        pair=[
+            {"market": "XSGD/USDC", "price_source": "wise", "qty_base": "100"},
+        ],
+    ))
+
+    pair = cfg.pairs[0]
+    assert pair.fixed_bps == Decimal("9")

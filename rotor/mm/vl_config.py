@@ -1,0 +1,204 @@
+"""TOML config loading for multi-pair VL market making."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+try:  # pragma: no cover - exercised only on Python >= 3.11.
+    # Python 3.11+ ships TOML parsing in the standard library.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on Python 3.10.
+    # Python 3.10 users get the same API from the tomli dependency.
+    import tomli as tomllib
+
+from rotor.price_reference import parse_market_symbol
+
+# Closed set of external reference providers accepted per pair.
+PRICE_SOURCE_CHOICES = {"wise", "ecb", "fed", "bnm", "mas"}
+
+
+@dataclass(frozen=True)
+class BudgetConfig:
+    """Shared collateral budget for one spent token symbol."""
+
+    # Token symbol whose spend is capped across VL siblings.
+    token: str
+    # Human-decimal maximum budget for the token.
+    amount: Decimal
+
+
+@dataclass(frozen=True)
+class PairConfig:
+    """Per-market VL quoting config."""
+
+    # Sera market label, normalized to BASE/QUOTE.
+    market: str
+    # Reference provider for this pair.
+    price_source: str
+    # Base-token order size before quantization.
+    qty_base: Decimal
+    # Fixed spread bps, possibly inherited from global config.
+    fixed_bps: Decimal
+
+
+@dataclass(frozen=True)
+class VLConfig:
+    """Validated VL strategy config."""
+
+    # Shared budget caps available to the VL strategy.
+    budgets: list[BudgetConfig]
+    # Market-specific quote configs.
+    pairs: list[PairConfig]
+    # Global defaults copied into pairs when pair-level values are absent.
+    fixed_bps: Decimal
+    # Distance from the latest source mid for the side tightened after a fill.
+    return_bps: Decimal
+
+    @property
+    def budget_tokens(self) -> set[str]:
+        """Return the set of token symbols with configured VL budgets."""
+        # This makes budget reachability checks cheap and declarative.
+        return {budget.token for budget in self.budgets}
+
+
+def load_vl_config(path: str | Path) -> VLConfig:
+    """Load and validate a VL TOML config file."""
+    # Normalize the path object so logging/errors can include a stable source.
+    config_path = Path(path)
+    # TOML files must be opened as bytes for tomllib/tomli.
+    with config_path.open("rb") as fh:
+        raw = tomllib.load(fh)
+    # Keep all validation in parse_vl_config so tests can use dict input.
+    return parse_vl_config(raw, source=str(config_path))
+
+
+def parse_vl_config(raw: dict[str, Any], *, source: str = "<memory>") -> VLConfig:
+    """Validate a parsed VL config dict."""
+    # Global strategy defaults apply to each pair unless the pair overrides.
+    fixed_bps = _decimal(raw, "fixed_bps", Decimal("8"))
+    return_bps = _decimal(raw, "return_bps", Decimal("1"))
+    if return_bps <= 0:
+        raise ValueError(f"{source}: return_bps must be > 0")
+
+    # Budgets define the shared spend caps that make VL safe.
+    budgets = _parse_budgets(raw.get("budget"), source=source)
+    # Pairs define the markets that will consume those shared budgets.
+    pairs = _parse_pairs(
+        raw.get("pair"),
+        source=source,
+        default_fixed_bps=fixed_bps,
+    )
+    # Reject inverse duplicates because they would compete for the same market
+    # exposure from opposite directions.
+    _validate_unique_markets(pairs, source=source)
+    return VLConfig(
+        budgets=budgets,
+        pairs=pairs,
+        fixed_bps=fixed_bps,
+        return_bps=return_bps,
+    )
+
+
+def _parse_budgets(value, *, source: str) -> list[BudgetConfig]:
+    """Parse and validate one or more `[[budget]]` TOML tables."""
+    # TOML table parsing is normalized so callers can pass one dict or a list.
+    rows = _list_table(value)
+    if not rows:
+        raise ValueError(f"{source}: at least one [[budget]] is required")
+    out: list[BudgetConfig] = []
+    seen: set[str] = set()
+    for i, row in enumerate(rows):
+        # Token symbols are case-insensitive externally but stored uppercase.
+        token = str(row.get("token", "")).strip().upper()
+        if not token:
+            raise ValueError(f"{source}: [[budget]] #{i + 1} missing token")
+        if token in seen:
+            raise ValueError(f"{source}: duplicate budget token {token}")
+        # Amount is required and must be positive.
+        amount = _decimal(row, "amount", None)
+        if amount <= 0:
+            raise ValueError(f"{source}: budget {token} amount must be > 0")
+        # Track duplicates and append the typed validated config row.
+        seen.add(token)
+        out.append(BudgetConfig(token=token, amount=amount))
+    return out
+
+
+def _parse_pairs(
+    value,
+    *,
+    source: str,
+    default_fixed_bps: Decimal,
+) -> list[PairConfig]:
+    """Parse and validate one or more `[[pair]]` TOML tables."""
+    rows = _list_table(value)
+    if not rows:
+        raise ValueError(f"{source}: at least one [[pair]] is required")
+    out: list[PairConfig] = []
+    for i, row in enumerate(rows):
+        # Normalize market spelling so `xsgd_usdc` and `XSGD/USDC` converge.
+        market = str(row.get("market", "")).strip().upper().replace("_", "/")
+        if not market:
+            raise ValueError(f"{source}: [[pair]] #{i + 1} missing market")
+        # Reuse the shared symbol parser for delimiter/side validation.
+        parse_market_symbol(market)
+        # Per-pair source controls where this market's benchmark comes from.
+        price_source = str(row.get("price_source", "wise")).strip().lower()
+        if price_source not in PRICE_SOURCE_CHOICES:
+            raise ValueError(f"{source}: unsupported price_source {price_source!r}")
+        # Quantity is mandatory per pair because markets have different scales.
+        qty_base = _decimal(row, "qty_base", None)
+        if qty_base <= 0:
+            raise ValueError(f"{source}: {market} qty_base must be > 0")
+        # Pair-level strategy values override globals; otherwise defaults apply.
+        out.append(
+            PairConfig(
+                market=market,
+                price_source=price_source,
+                qty_base=qty_base,
+                fixed_bps=_decimal(row, "fixed_bps", default_fixed_bps),
+            )
+        )
+    return out
+
+
+def _validate_unique_markets(pairs: list[PairConfig], *, source: str) -> None:
+    """Reject duplicate markets even when configured in inverse order."""
+    seen: dict[tuple[str, str], str] = {}
+    for pair in pairs:
+        # Parse BASE/QUOTE and sort to make X/Y and Y/X collide.
+        base, quote = parse_market_symbol(pair.market)
+        canonical = tuple(sorted((base, quote)))
+        if canonical in seen:
+            raise ValueError(
+                f"{source}: duplicate or inverse market {pair.market} "
+                f"conflicts with {seen[canonical]}"
+            )
+        # Store the first configured spelling for a helpful conflict message.
+        seen[canonical] = pair.market
+
+
+def _list_table(value) -> list[dict[str, Any]]:
+    """Normalize TOML table input into a list of dict rows."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        # Copy rows so later validation cannot mutate caller-owned data.
+        return [dict(row) for row in value]
+    # A single table is accepted as a one-row list for tests/flexibility.
+    return [dict(value)]
+
+
+def _decimal(row: dict[str, Any], key: str, default: Decimal | None) -> Decimal:
+    """Read a Decimal config value with an optional default."""
+    value = row.get(key, default)
+    if value is None:
+        raise ValueError(f"missing required {key}")
+    try:
+        # Convert through str to avoid binary float artifacts.
+        return Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{key} must be decimal, got {value!r}") from exc
